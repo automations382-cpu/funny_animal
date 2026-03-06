@@ -1,9 +1,10 @@
 """
-sourcer.py — Video Sourcing Module (v6 — Ultimate Sourcing)
+sourcer.py — Video Sourcing Module (v7 — Pexels Primary + Robust YouTube)
 
 Priority 1: Pexels API (Unblockable, high quality portrait videos)
-Priority 2: Reddit .json (Stealth headers)
-Priority 3: YouTube Shorts (ytsearch5: with duration limits)
+Priority 2: YouTube Shorts (ytsearch5: with duration limits)
+
+NO Reddit included due to absolute 403 blocks on GitHub Actions IPs.
 """
 
 import os
@@ -19,14 +20,13 @@ BASE_DIR = Path(__file__).parent
 RAW_DIR = BASE_DIR / ".tmp" / "raw"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_CLIP_COUNT = 5  # Usually need 3, getting 5 to be safe
-MIN_DURATION = 5
+TARGET_CLIP_COUNT = 3
+MIN_DURATION = 10
 MAX_DURATION = 50
 
 # Sourcing Queries
-PEXELS_Q = ["funny dog", "cute cat", "animal fails", "funny animal", "funny pet"]
-YT_QUERIES = ["funny animal fails 2026", "dog memes shorts", "cute cat fails shorts", "funny pet shorts"]
-SUBREDDITS = ["funnyanimals", "AnimalsBeingDerps", "aww", "catvideos", "dogvideos"]
+PEXELS_Q = ["funny animal fails", "cute pets"]
+YT_QUERIES = ["funny animal shorts", "dog memes shorts", "cute cat fails shorts"]
 
 
 def _dl(url: str, dest: Path) -> bool:
@@ -109,98 +109,7 @@ def fetch_pexels_clips(api_key: str, count: int) -> list[Path]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  2. Reddit JSON (Stealth Fallback)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def fetch_reddit_clips(user_agent: str, count: int) -> list[Path]:
-    """Scan multiple subreddits, download top viral videos via .json."""
-    if count <= 0: return []
-    
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
-    }
-    
-    all_posts = []
-    subs = list(SUBREDDITS)
-    random.shuffle(subs)
-    
-    for sub in subs:
-        print(f"[sourcer] Reddit: Scanning r/{sub}/top.json ...")
-        url = f"https://www.reddit.com/r/{sub}/top.json"
-        params = {"t": "day", "limit": 10, "raw_json": 1}
-        
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
-            if resp.status_code == 429:
-                print(f"[sourcer] Reddit: Rate-limited (429) on r/{sub}")
-                continue
-            elif resp.status_code == 403:
-                print(f"[sourcer] Reddit: Blocked (403) on r/{sub}. Headers might be flagged.")
-                continue
-                
-            resp.raise_for_status()
-            
-            for child in resp.json().get("data", {}).get("children", []):
-                d = child.get("data", {})
-                if d.get("over_18"):
-                    continue
-                if not d.get("is_video") and "v.redd.it" not in d.get("url", ""):
-                    continue
-                all_posts.append({
-                    "url": f"https://www.reddit.com{d['permalink']}",
-                    "title": d.get("title", ""),
-                    "score": d.get("score", 0),
-                })
-        except Exception as e:
-            print(f"[sourcer] Reddit error r/{sub}: {e}")
-
-    # Deduplicate and sort by score
-    seen, unique = set(), []
-    for p in all_posts:
-        if p["url"] not in seen:
-            seen.add(p["url"])
-            unique.append(p)
-    unique.sort(key=lambda p: p["score"], reverse=True)
-    
-    print(f"[sourcer] Reddit: {len(unique)} unique video posts found.")
-
-    downloaded = []
-    for post in unique[:count * 2]:
-        if len(downloaded) >= count:
-            break
-            
-        dest = RAW_DIR / f"reddit_{post['url'].split('/')[-2]}.mp4"
-        if dest.exists() and dest.stat().st_size > 50_000:
-            downloaded.append(dest)
-            continue
-            
-        cmd = [
-            sys.executable, "-m", "yt_dlp", "--no-warnings", "--quiet",
-            post["url"], "--output", str(dest),
-            "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
-            "--merge-output-format", "mp4", "--no-playlist",
-            "--max-filesize", "50M",
-            "--match-filter", f"duration >= {MIN_DURATION} & duration <= {MAX_DURATION}",
-        ]
-        
-        try:
-            print(f"[sourcer] Reddit: Downloading '...{post['url'][-20:]}'")
-            subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if dest.exists() and dest.stat().st_size > 50_000:
-                downloaded.append(dest)
-                print(f"[sourcer]   ✓ Reddit downloaded: {dest.name}")
-        except Exception as e:
-            print(f"[sourcer] yt-dlp error on Reddit video: {e}")
-            
-    return downloaded
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  3. YouTube Shorts (Failsafe)
+#  2. YouTube Shorts (Failsafe)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_yt_shorts(count: int) -> list[Path]:
@@ -221,7 +130,7 @@ def fetch_yt_shorts(count: int) -> list[Path]:
         # ytsearch{limit}: ensures it searches in the cloud
         cmd = [
             sys.executable, "-m", "yt_dlp", "--no-warnings", "--quiet",
-            f"ytsearch5:{query} #shorts", "--output", tpl,
+            f"ytsearch5:{query}", "--output", tpl,
             "--match-filter", f"duration >= {MIN_DURATION} & duration <= {MAX_DURATION}",
             "--format", "mp4/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
             "--merge-output-format", "mp4", "--no-playlist", "--ignore-errors",
@@ -249,33 +158,32 @@ def fetch_yt_shorts(count: int) -> list[Path]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_clips(
-    user_agent: str = "",
+    user_agent: str = "", # Optional, kept since main.py might pass it in.
     pexels_key: str = "",
     pixabay_key: str = "",
     count: int = TARGET_CLIP_COUNT,
 ) -> list[Path]:
     """
-    Ultimate Sourcing Flow:
+    Ultimate Sourcing Flow (Reddit 403-proof version):
       1. Pexels (if key provided) -> primary because it's rarely blocked.
-      2. Reddit (stealth headers) -> secondary viral content.
-      3. YouTube Shorts -> robust fallback.
+      2. YouTube Shorts -> robust fallback.
     """
-    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     collected: list[Path] = []
 
     # 1. Pexels API
-    if pexels_key:
-        collected += fetch_pexels_clips(pexels_key, count)
+    try:
+        if pexels_key:
+            collected += fetch_pexels_clips(pexels_key, count)
+    except Exception as e:
+        print(f"[sourcer] Unhandled exception in fetch_pexels_clips: {e}")
         
-    # 2. Reddit .json
-    if len(collected) < count:
-        needed = count - len(collected)
-        collected += fetch_reddit_clips(ua, needed)
-        
-    # 3. YouTube Shorts 
-    if len(collected) < count:
-        needed = count - len(collected)
-        collected += fetch_yt_shorts(needed)
+    # 2. YouTube Shorts 
+    try:
+        if len(collected) < count:
+            needed = count - len(collected)
+            collected += fetch_yt_shorts(needed)
+    except Exception as e:
+        print(f"[sourcer] Unhandled exception in fetch_yt_shorts: {e}")
 
     collected = collected[:count]
     print(f"\n[sourcer] ✓ Sourcing Complete. Collected {len(collected)}/{count} clips.")
@@ -287,7 +195,6 @@ if __name__ == "__main__":
     load_dotenv(BASE_DIR / ".env")
     
     clips = fetch_clips(
-        user_agent=os.getenv("REDDIT_USER_AGENT", ""),
         pexels_key=os.getenv("PEXELS_API_KEY", ""),
         count=3,
     )
