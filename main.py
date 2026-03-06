@@ -8,7 +8,7 @@ Modes:
 
 Full v5 flow (AI mode):
   1. sourcer.py     → Reddit .json bypass + yt-dlp + fallbacks
-  2. ai_director.py → faster-whisper → GPT-4o → Groq → Tenor → MoviePy assembly
+  2. ai_director.py → faster-whisper → GPT-4o → Groq → Giphy → MoviePy assembly
   3. uploader.py    → Upload .mp4 + .txt to Google Drive
 """
 
@@ -26,13 +26,13 @@ from uploader import upload_reel_package
 
 
 def run_ai_mode(raw_clips: list[Path]) -> Path | None:
-    """Run GPT-4o + Groq + Whisper + Tenor + MoviePy pipeline."""
+    """Run GPT-4o + Groq + Whisper + Giphy + MoviePy pipeline."""
     from ai_director import build_ai_reel
     return build_ai_reel(
         raw_clips,
         github_token=os.getenv("GITHUB_TOKEN", ""),
         groq_key=os.getenv("GROQ_API_KEY", ""),
-        tenor_key=os.getenv("TENOR_API_KEY", ""),
+        giphy_key=os.getenv("GIPHY_API_KEY", ""),
     )
 
 

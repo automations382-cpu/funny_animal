@@ -5,7 +5,7 @@ AI Stack:
   • GPT-4o (via GitHub Models endpoint) — Analyses faster-whisper transcript,
     decides punchline text, timing, and meme keyword.
   • Groq (Llama 3) — Generates Instagram caption + hashtags from the video title.
-  • Tenor API — Downloads meme clips on the fly (no local folder).
+  • Giphy API — Downloads meme clips on the fly (no local folder).
   • faster-whisper — Word-level timestamps for Hormozi-style captions.
   • MoviePy — Composites everything onto the White Meme Card.
 
@@ -58,7 +58,7 @@ Analyze it and return ONLY a valid JSON object — no markdown fences, no extra 
   "text_start_time": <float seconds>,
   "text_end_time": <float seconds>,
   "meme_insert_timestamp": <float, exact second to pause video and insert a meme>,
-  "meme_search_query": "2-3 word Tenor search query for a reaction meme (e.g. laughing cat, shocked pikachu)"
+  "meme_search_query": "2-3 word Giphy search query for a reaction meme (e.g. laughing cat, shocked pikachu)"
 }
 
 Rules:
@@ -208,40 +208,44 @@ def save_caption(caption: str, video_path: Path) -> Path:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Tenor API — On-the-fly meme fetching
+#  Giphy API — On-the-fly meme fetching
 # ══════════════════════════════════════════════════════════════════════════════
 
-TENOR_API = "https://tenor.googleapis.com/v2/search"
+GIPHY_API = "https://api.giphy.com/v1/gifs/search"
 
-def fetch_tenor_meme(query: str, tenor_key: str = "") -> Optional[Path]:
-    """Search Tenor for a meme .mp4 by keyword. Caches results."""
-    name = query.lower().replace(" ", "_")[:30]
-    cached = MEME_CACHE / f"tenor_{name}.mp4"
+def fetch_giphy_meme(query: str, giphy_key: str = "") -> Optional[Path]:
+    """Search Giphy for a meme .mp4 by keyword. Caches results."""
+    name = query.lower().replace(" ", "_").replace("/", "")[:30]
+    cached = MEME_CACHE / f"giphy_{name}.mp4"
     if cached.exists() and cached.stat().st_size > 5_000:
-        print(f"[ai_director] Tenor cache hit: {cached.name}")
+        print(f"[ai_director] Giphy cache hit: {cached.name}")
         return cached
 
+    if not giphy_key:
+        print("[ai_director] No GIPHY_API_KEY provided")
+        return None
+
     params = {
-        "q": query, "limit": 5, "media_filter": "mp4", "contentfilter": "medium",
-        "key": tenor_key or "AIzaSyAyimkuYQYF_FXVALexPuGQctUWRURdCYQ",
+        "api_key": giphy_key,
+        "q": query,
+        "limit": 1
     }
+    
     try:
-        print(f"[ai_director] Tenor search: '{query}' ...")
-        resp = http_req.get(TENOR_API, params=params, timeout=10)
+        print(f"[ai_director] Giphy search: '{query}' ...")
+        resp = http_req.get(GIPHY_API, params=params, timeout=10)
         if resp.status_code != 200:
-            print(f"[ai_director] Tenor HTTP {resp.status_code}")
+            print(f"[ai_director] Giphy HTTP {resp.status_code}: {resp.text}")
             return None
-        results = resp.json().get("results", [])
-        mp4_url = None
-        for r in results:
-            fmts = r.get("media_formats", {})
-            for fmt in ["mp4", "loopedmp4", "tinymp4"]:
-                if fmt in fmts and fmts[fmt].get("url"):
-                    mp4_url = fmts[fmt]["url"]
-                    break
-            if mp4_url:
-                break
+            
+        data = resp.json().get("data", [])
+        if not data:
+            print(f"[ai_director] Giphy returned no results for '{query}'")
+            return None
+            
+        mp4_url = data[0].get("images", {}).get("original", {}).get("mp4")
         if not mp4_url:
+            print(f"[ai_director] Giphy result missing MP4 URL")
             return None
 
         with http_req.get(mp4_url, stream=True, timeout=30) as dl:
@@ -249,12 +253,14 @@ def fetch_tenor_meme(query: str, tenor_key: str = "") -> Optional[Path]:
             with open(cached, "wb") as f:
                 for chunk in dl.iter_content(262144):
                     f.write(chunk)
+                    
         if cached.stat().st_size > 5_000:
-            print(f"[ai_director] ✓ Tenor meme → {cached.name}")
+            print(f"[ai_director] ✓ Giphy meme → {cached.name}")
             return cached
+            
         cached.unlink()
     except Exception as e:
-        print(f"[ai_director] Tenor error: {e}")
+        print(f"[ai_director] Giphy error: {e}")
     return None
 
 
@@ -393,7 +399,7 @@ def assemble_segment(
     plan: Optional[dict],
     words: list[dict],
     idx: int,
-    tenor_key: str = "",
+    giphy_key: str = "",
 ) -> Optional[Path]:
     """
     Build one processed segment:
@@ -426,7 +432,7 @@ def assemble_segment(
         # Meme insert
         if plan and plan.get("meme_insert_timestamp") and plan.get("meme_search_query"):
             split = max(1.0, min(float(plan["meme_insert_timestamp"]), dur - 1.0))
-            meme = fetch_tenor_meme(plan["meme_search_query"], tenor_key)
+            meme = fetch_giphy_meme(plan["meme_search_query"], giphy_key)
             if meme and split < comp.duration:
                 p1 = comp.subclip(0, split)
                 mr = VideoFileClip(str(meme)).subclip(0, min(
@@ -460,7 +466,7 @@ def build_ai_reel(
     raw_clips: list[Path],
     github_token: str = "",
     groq_key: str = "",
-    tenor_key: str = "",
+    giphy_key: str = "",
     video_titles: Optional[list[str]] = None,
 ) -> Optional[Path]:
     """
@@ -469,7 +475,7 @@ def build_ai_reel(
       1. faster-whisper → word-level transcript
       2. GPT-4o (GitHub) → editing plan (punchline, timestamps, meme query)
       3. Groq (Llama 3) → Instagram caption
-      4. Tenor → download meme on the fly
+      4. Giphy → download meme on the fly
       5. MoviePy → white card assembly
     """
     segments: list[Path] = []
@@ -501,7 +507,7 @@ def build_ai_reel(
         all_captions.append(caption)
 
         # ── Assemble ──────────────────────────────────────────────
-        seg = assemble_segment(clip, plan, words, i, tenor_key)
+        seg = assemble_segment(clip, plan, words, i, giphy_key)
         if seg:
             segments.append(seg)
 
@@ -546,9 +552,9 @@ if __name__ == "__main__":
 
     github_token = "" if args.no_ai else os.getenv("GITHUB_TOKEN", "")
     groq_key = "" if args.no_ai else os.getenv("GROQ_API_KEY", "")
-    tenor_key = os.getenv("TENOR_API_KEY", "")
+    giphy_key = os.getenv("GIPHY_API_KEY", "")
     paths = [Path(p) for p in args.clips if Path(p).exists()]
     if not paths:
         print("No valid clips"); sys.exit(1)
 
-    build_ai_reel(paths, github_token, groq_key, tenor_key)
+    build_ai_reel(paths, github_token, groq_key, giphy_key)
