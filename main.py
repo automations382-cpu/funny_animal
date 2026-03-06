@@ -1,104 +1,98 @@
 """
-main.py — Master Orchestrator for Funny Animal Instagram Reels Pipeline (v2)
+main.py — Master Orchestrator (v5 — Groq + OpenAI Edition)
 
 Modes:
-  --mode ai       Use Gemini AI Director + MoviePy (default)
-  --mode ffmpeg   Use the classic FFmpeg processor (faster, no AI)
+  --mode ai       GPT-4o + Groq + faster-whisper + Tenor + MoviePy  (default)
+  --mode ffmpeg   Classic FFmpeg overlay (faster, no AI)
   --dry-run       Skip Google Drive upload
 
-Full v2 flow (AI mode):
-  1. sourcer.py   → Download clips from Reddit/YT Shorts/Pexels/Pixabay
-  2. card_generator.py → Generate White Meme Card PNG + determine video slot
-  3. captioner.py → Generate caption + hashtags via Gemini
-  4. ai_director.py → Analyse each clip with Gemini, assemble with MoviePy
-  5. uploader.py  → Upload .mp4 + .txt to Google Drive "Ready for Make"
+Full v5 flow (AI mode):
+  1. sourcer.py     → Reddit .json bypass + yt-dlp + fallbacks
+  2. ai_director.py → faster-whisper → GPT-4o → Groq → Tenor → MoviePy assembly
+  3. uploader.py    → Upload .mp4 + .txt to Google Drive
 """
 
-import os
-import sys
-import argparse
+import os, sys, argparse
 from pathlib import Path
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+BASE_DIR = Path(__file__).parent
+load_dotenv(BASE_DIR / ".env")
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(BASE_DIR))
 
 from sourcer import fetch_clips
-from captioner import generate_caption, fallback_caption, save_caption
 from uploader import upload_reel_package
 
 
-def run_ai_mode(raw_clips: list[Path], gemini_key: str, tenor_key: str) -> Path | None:
-    """Run the Gemini AI Director + MoviePy assembly pipeline."""
-    from card_generator import generate_card
+def run_ai_mode(raw_clips: list[Path]) -> Path | None:
+    """Run GPT-4o + Groq + Whisper + Tenor + MoviePy pipeline."""
     from ai_director import build_ai_reel
-    return build_ai_reel(raw_clips, gemini_key, tenor_key)
+    return build_ai_reel(
+        raw_clips,
+        github_token=os.getenv("GITHUB_TOKEN", ""),
+        groq_key=os.getenv("GROQ_API_KEY", ""),
+        tenor_key=os.getenv("TENOR_API_KEY", ""),
+    )
 
 
-def run_ffmpeg_mode(
-    raw_clips: list[Path],
-    caption: str,
-) -> Path | None:
+def run_ffmpeg_mode(raw_clips: list[Path], caption: str) -> Path | None:
     """Run the classic FFmpeg White Card overlay pipeline."""
     from card_generator import generate_card
     from processor import build_reel
-
     card_path, video_slot = generate_card(caption)
     return build_reel(raw_clips, card_path, video_slot)
 
 
 def main(mode: str = "ai", dry_run: bool = False):
     print("=" * 60)
-    print("  🐾 FUNNY ANIMAL REELS PIPELINE v2")
+    print("  🐾 FUNNY ANIMAL REELS PIPELINE v5 (Groq + OpenAI)")
     print(f"  Mode: {mode.upper()}")
     print("=" * 60)
 
+    user_agent = os.getenv("REDDIT_USER_AGENT", "")
     pexels_key = os.getenv("PEXELS_API_KEY", "")
     pixabay_key = os.getenv("PIXABAY_API_KEY", "")
-    gemini_key = os.getenv("GEMINI_API_KEY", "")
-    tenor_key = os.getenv("TENOR_API_KEY", "")
 
     # ── STEP 1: Source ───────────────────────────────────────────
     print("\n[STEP 1] Sourcing videos...")
-    raw_clips = fetch_clips(pexels_key=pexels_key, pixabay_key=pixabay_key)
+    raw_clips = fetch_clips(
+        user_agent=user_agent,
+        pexels_key=pexels_key,
+        pixabay_key=pixabay_key,
+    )
     if not raw_clips:
-        print("[main] ❌ No clips downloaded — check your network or API keys")
+        print("[main] ❌ No clips downloaded")
         sys.exit(1)
     print(f"[main] ✓ {len(raw_clips)} clips ready")
 
-    # ── STEP 2: Generate caption (used in both modes) ────────────
-    print("\n[STEP 2] Generating caption...")
-    caption_text = generate_caption(gemini_key) if gemini_key else fallback_caption()
-    print(f"[main] Caption preview:\n{caption_text}\n" + "-" * 40)
-
-    # ── STEP 3: Process video ────────────────────────────────────
-    print(f"\n[STEP 3] Assembling reel ({mode} mode)...")
+    # ── STEP 2: Process ─────────────────────────────────────────
+    print(f"\n[STEP 2] Assembling reel ({mode} mode)...")
     if mode == "ai":
-        output_video = run_ai_mode(raw_clips, gemini_key, tenor_key)
+        output_video = run_ai_mode(raw_clips)
     else:
-        output_video = run_ffmpeg_mode(raw_clips, caption_text)
+        # FFmpeg mode needs a simple caption
+        from captioner import generate_caption, fallback_caption
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        caption = generate_caption(gemini_key) if gemini_key else fallback_caption()
+        output_video = run_ffmpeg_mode(raw_clips, caption)
 
     if not output_video or not output_video.exists():
         print("[main] ❌ Video assembly failed")
         sys.exit(1)
-
     print(f"[main] ✓ Reel ready: {output_video.name}")
 
-    # ── STEP 4: Save caption alongside video ─────────────────────
-    caption_file = save_caption(caption_text, output_video)
-
-    # ── STEP 5: Upload to Google Drive ───────────────────────────
+    # ── STEP 3: Upload ───────────────────────────────────────────
+    caption_file = output_video.with_suffix(".txt")
     if dry_run:
-        print("\n[STEP 4] DRY RUN — skipping Drive upload")
+        print("\n[STEP 3] DRY RUN — skipping Drive upload")
         print(f"  Video:   {output_video}")
         print(f"  Caption: {caption_file}")
     else:
-        print("\n[STEP 4] Uploading to Google Drive...")
+        print("\n[STEP 3] Uploading to Google Drive...")
         try:
             result = upload_reel_package(output_video, caption_file)
-            print(f"[main] ✓ Uploaded to Drive (folder_id={result['folder_id']})")
+            print(f"[main] ✓ Uploaded (folder_id={result['folder_id']})")
         except FileNotFoundError as e:
             print(f"[main] ⚠️  Drive skipped: {e}")
 
@@ -108,14 +102,8 @@ def main(mode: str = "ai", dry_run: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Funny Animal Reels Pipeline v2")
-    parser.add_argument(
-        "--mode", choices=["ai", "ffmpeg"], default="ai",
-        help="ai = Gemini+MoviePy (default) | ffmpeg = classic FFmpeg overlay"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Skip Google Drive upload"
-    )
+    parser = argparse.ArgumentParser(description="Funny Animal Reels v5")
+    parser.add_argument("--mode", choices=["ai", "ffmpeg"], default="ai")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     main(mode=args.mode, dry_run=args.dry_run)
