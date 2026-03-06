@@ -6,16 +6,22 @@ python-dotenv>=1.0.0
 google-api-python-client>=2.100.0
 google-auth-httplib2>=0.1.1
 google-auth-oauthlib>=1.1.0
-google-generativeai>=0.7.0
+google-genai>=1.0.0
 
 # Image processing (White Meme Card, watermark, emoji rendering)
 Pillow>=10.2.0
 
 # Video editing (MoviePy-based AI director assembly)
-moviepy>=1.0.3
+moviepy<2.0
 imageio>=2.34.0
 imageio-ffmpeg>=0.4.9
 numpy>=1.26.0
 
-# Video sourcing (Reddit, YouTube Shorts scraping — no API key needed)
+# Video sourcing (Reddit, YouTube Shorts scraping)
 yt-dlp>=2024.3.10
+
+# Reddit API (authenticated, viral video sourcing)
+praw>=7.7.0
+
+# Speech-to-text (word-level timestamps for dynamic captions)
+faster-whisper>=1.0.0

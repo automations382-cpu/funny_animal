@@ -1,10 +1,13 @@
 """
-sourcer.py — Video Sourcing Module (v2)
+sourcer.py — Video Sourcing Module (v3 - Praw + yt-dlp)
+
 Sources funny animal videos from:
-  - Pexels API (free, API key required)
-  - Pixabay API (free, API key required)
-  - Reddit (r/funnyanimals, r/aww, etc.) via yt-dlp — NO API key needed
-  - YouTube Shorts via yt-dlp — NO API key needed
+  1. Reddit via praw (authenticated API) — Top 5 most upvoted video posts
+     from the last 24 hours across r/funnyanimals, r/AnimalsBeingDerps, etc.
+  2. YouTube Shorts via yt-dlp — NO API key needed (fallback)
+  3. Pexels / Pixabay — free API fallback
+
+Priority: Reddit (praw) → YouTube Shorts → Pexels/Pixabay
 Downloads raw .mp4 clips to .tmp/raw/
 """
 
@@ -16,6 +19,7 @@ import argparse
 import subprocess
 import requests
 from pathlib import Path
+from typing import Optional
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -25,16 +29,16 @@ RAW_DIR.mkdir(parents=True, exist_ok=True)
 TARGET_CLIP_COUNT = 8
 MAX_DURATION_SECS = 90
 
-# Reddit subreddits to pull from (yt-dlp can scrape these natively)
+# Reddit subreddits to scan for viral animal content
 REDDIT_SUBREDDITS = [
-    "r/funnyanimals",
-    "r/aww",
-    "r/AnimalsBeingDerps",
-    "r/catvideos",
-    "r/dogvideos",
+    "funnyanimals",
+    "AnimalsBeingDerps",
+    "aww",
+    "catvideos",
+    "dogvideos",
 ]
 
-# YouTube Shorts search queries
+# YouTube Shorts search queries (fallback)
 YT_SHORTS_QUERIES = [
     "funny cat shorts",
     "funny dog fail shorts",
@@ -46,59 +50,165 @@ PEXELS_QUERIES = ["funny cat", "funny dog", "funny animal", "cute animal fail"]
 PIXABAY_QUERIES = ["funny animal", "funny pet", "cute dog funny", "funny cat video"]
 
 
-# ── yt-dlp helpers ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SOURCE 1: Reddit via praw (authenticated, precise, viral-proven)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _run_ytdlp(args: list[str], desc: str = "") -> dict | None:
-    """Run yt-dlp as a subprocess and return parsed JSON, or None on failure."""
+def _init_praw() -> Optional[object]:
+    """
+    Initialize praw Reddit instance from environment variables.
+    Required env vars:
+        REDDIT_CLIENT_ID
+        REDDIT_CLIENT_SECRET
+        REDDIT_USER_AGENT  (e.g. "madanimalx-bot/1.0 by u/your_username")
+    Returns praw.Reddit instance, or None if credentials missing.
+    """
+    try:
+        import praw
+    except ImportError:
+        print("[sourcer] praw not installed — run: pip install praw")
+        return None
+
+    client_id = os.getenv("REDDIT_CLIENT_ID", "")
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "")
+    user_agent = os.getenv("REDDIT_USER_AGENT", "madanimalx-bot/1.0")
+
+    if not client_id or not client_secret:
+        print("[sourcer] REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET not set — skipping praw")
+        return None
+
+    try:
+        reddit = praw.Reddit(
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent,
+        )
+        # Test the connection (read-only mode)
+        reddit.read_only = True
+        print(f"[sourcer] ✓ praw authenticated (read-only, user_agent={user_agent})")
+        return reddit
+    except Exception as e:
+        print(f"[sourcer] praw init failed: {e}")
+        return None
+
+
+def fetch_reddit_viral(reddit_instance, subreddit_name: str, limit: int = 5) -> list[str]:
+    """
+    Fetch the top `limit` most upvoted video posts from the last 24 hours
+    in a given subreddit using praw.
+
+    Returns a list of direct Reddit post URLs that contain video.
+    These URLs are then passed to yt-dlp for downloading.
+    """
+    urls = []
+    try:
+        subreddit = reddit_instance.subreddit(subreddit_name)
+        # "top" with time_filter="day" = top posts in the last 24 hours
+        for submission in subreddit.top(time_filter="day", limit=limit * 2):
+            # Only keep posts that are actual videos
+            is_video = (
+                submission.is_video
+                or "v.redd.it" in (submission.url or "")
+                or submission.domain in ("v.redd.it", "youtube.com", "youtu.be")
+            )
+            if is_video and not submission.over_18:
+                urls.append(f"https://www.reddit.com{submission.permalink}")
+                print(f"[sourcer]   ↳ r/{subreddit_name}: \"{submission.title[:60]}\" "
+                      f"(↑{submission.score})")
+                if len(urls) >= limit:
+                    break
+    except Exception as e:
+        print(f"[sourcer] Error scanning r/{subreddit_name}: {e}")
+    return urls
+
+
+def download_with_ytdlp(url: str, output_dir: Path, prefix: str = "reddit") -> Optional[Path]:
+    """
+    Download a single video URL using yt-dlp.
+    Returns the path to the downloaded .mp4, or None on failure.
+    """
+    output_template = str(output_dir / f"{prefix}_%(id)s.%(ext)s")
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "--no-warnings",
-        "--quiet",
-    ] + args
-    if desc:
-        print(f"[sourcer] {desc}")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            return result.stdout
-        else:
-            print(f"[sourcer] yt-dlp stderr: {result.stderr[:300]}")
-            return None
-    except subprocess.TimeoutExpired:
-        print("[sourcer] yt-dlp timed out")
-        return None
-    except Exception as e:
-        print(f"[sourcer] yt-dlp error: {e}")
-        return None
-
-
-def fetch_reddit_clips(subreddit: str, limit: int = 5) -> list[Path]:
-    """Download top short videos from a Reddit subreddit using yt-dlp."""
-    url = f"https://www.reddit.com/{subreddit}/top/?t=day"
-    output_template = str(RAW_DIR / "reddit_%(id)s.%(ext)s")
-
-    result = _run_ytdlp([
+        "--no-warnings", "--quiet",
         url,
         "--output", output_template,
-        "--max-downloads", str(limit),
-        "--match-filter", f"duration <= {MAX_DURATION_SECS}",
         "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
         "--merge-output-format", "mp4",
         "--no-playlist",
-        "--ignore-errors",
-        "--extractor-args", "reddit:sort=top",
-    ], desc=f"Scraping {subreddit} ...")
+        "--max-filesize", "50M",
+        f"--match-filter", f"duration <= {MAX_DURATION_SECS}",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            # Find the newly created file
+            new_files = sorted(output_dir.glob(f"{prefix}_*.mp4"), key=lambda p: p.stat().st_mtime)
+            if new_files:
+                latest = new_files[-1]
+                if latest.stat().st_size > 50_000:
+                    return latest
+        else:
+            stderr = result.stderr[:200] if result.stderr else ""
+            print(f"[sourcer] yt-dlp failed for {url[:60]}: {stderr}")
+    except subprocess.TimeoutExpired:
+        print(f"[sourcer] yt-dlp timed out for {url[:60]}")
+    except Exception as e:
+        print(f"[sourcer] yt-dlp error: {e}")
+    return None
 
-    # Return any newly created mp4s
-    return _collect_new_mp4s(RAW_DIR, prefix="reddit_")
 
+def fetch_praw_clips(limit_per_sub: int = 5) -> list[Path]:
+    """
+    Main praw sourcing function.
+    Scans multiple subreddits, fetches top viral video URLs,
+    and downloads them via yt-dlp.
+    Returns list of downloaded .mp4 paths.
+    """
+    reddit = _init_praw()
+    if reddit is None:
+        return []
+
+    all_urls: list[str] = []
+    # Shuffle subreddits for variety across runs
+    subs = list(REDDIT_SUBREDDITS)
+    random.shuffle(subs)
+
+    for sub in subs:
+        print(f"[sourcer] Scanning r/{sub} (top/day) ...")
+        urls = fetch_reddit_viral(reddit, sub, limit=limit_per_sub)
+        all_urls.extend(urls)
+
+    # Deduplicate
+    all_urls = list(dict.fromkeys(all_urls))
+    print(f"[sourcer] Found {len(all_urls)} viral video URLs from Reddit")
+
+    # Download each URL
+    downloaded: list[Path] = []
+    before_files = set(RAW_DIR.glob("*.mp4"))
+
+    for url in all_urls:
+        path = download_with_ytdlp(url, RAW_DIR, prefix="reddit")
+        if path and path not in before_files:
+            downloaded.append(path)
+            print(f"[sourcer]   ✓ Downloaded → {path.name}")
+
+    print(f"[sourcer] Reddit (praw) → {len(downloaded)} clips downloaded")
+    return downloaded
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SOURCE 2: YouTube Shorts via yt-dlp (no API key needed)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_youtube_shorts(query: str, limit: int = 4) -> list[Path]:
     """Search YouTube Shorts for a query and download short clips via yt-dlp."""
     search_url = f"ytsearch{limit}:{query} #shorts"
     output_template = str(RAW_DIR / "yt_%(id)s.%(ext)s")
 
-    _run_ytdlp([
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-warnings", "--quiet",
         search_url,
         "--output", output_template,
         "--match-filter", f"duration <= {MAX_DURATION_SECS}",
@@ -106,8 +216,12 @@ def fetch_youtube_shorts(query: str, limit: int = 4) -> list[Path]:
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--ignore-errors",
-        "--extractor-args", "youtube:skip=translated_subs",
-    ], desc=f"Searching YouTube Shorts: '{query}' ...")
+    ]
+    print(f"[sourcer] Searching YouTube Shorts: '{query}' ...")
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        print(f"[sourcer] YouTube Shorts error: {e}")
 
     return _collect_new_mp4s(RAW_DIR, prefix="yt_")
 
@@ -118,7 +232,9 @@ def _collect_new_mp4s(directory: Path, prefix: str = "") -> list[Path]:
     return [f for f in files if f.stat().st_size > 50_000]
 
 
-# ── Pexels / Pixabay helpers (fallback) ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SOURCE 3: Pexels / Pixabay APIs (free, fallback)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_pexels_videos(api_key: str, query: str, per_page: int = 10) -> list[dict]:
     """Fetch video metadata from Pexels Videos API."""
@@ -219,7 +335,9 @@ def fetch_api_clips(pexels_key: str, pixabay_key: str, count: int) -> list[Path]
     return downloaded
 
 
-# ── Main public function ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Main public function
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_clips(
     pexels_key: str = "",
@@ -228,20 +346,16 @@ def fetch_clips(
 ) -> list[Path]:
     """
     Aggregate clips from all sources.
-    Priority: Reddit > YouTube Shorts > Pexels/Pixabay fallback.
+    Priority: Reddit (praw, viral-proven) → YouTube Shorts → Pexels/Pixabay.
     Returns list of downloaded .mp4 paths.
     """
     collected: list[Path] = []
 
-    # ── Source 1: Reddit via yt-dlp ──────────────────────────────
-    subreddit = random.choice(REDDIT_SUBREDDITS)
-    before = set(RAW_DIR.glob("*.mp4"))
-    reddit_clips = fetch_reddit_clips(subreddit, limit=4)
-    new_reddit = [p for p in reddit_clips if p not in before]
-    collected += new_reddit
-    print(f"[sourcer] Reddit → {len(new_reddit)} new clips from {subreddit}")
+    # ── Source 1: Reddit via praw (top viral posts) ──────────────
+    praw_clips = fetch_praw_clips(limit_per_sub=5)
+    collected += praw_clips
 
-    # ── Source 2: YouTube Shorts via yt-dlp ─────────────────────
+    # ── Source 2: YouTube Shorts via yt-dlp ──────────────────────
     if len(collected) < count:
         need = count - len(collected)
         yt_query = random.choice(YT_SHORTS_QUERIES)
@@ -251,7 +365,7 @@ def fetch_clips(
         collected += new_yt
         print(f"[sourcer] YouTube Shorts → {len(new_yt)} new clips")
 
-    # ── Source 3: Pexels / Pixabay (fallback) ───────────────────
+    # ── Source 3: Pexels / Pixabay (fallback) ────────────────────
     if len(collected) < count and (pexels_key or pixabay_key):
         need = count - len(collected)
         print(f"[sourcer] Fetching {need} more from Pexels/Pixabay ...")
@@ -268,7 +382,7 @@ def fetch_clips(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test", action="store_true", help="Fetch only 2 clips for quick test")
+    parser.add_argument("--test", action="store_true", help="Fetch only 2 clips")
     args = parser.parse_args()
 
     from dotenv import load_dotenv

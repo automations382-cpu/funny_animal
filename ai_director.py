@@ -1,23 +1,19 @@
 """
-ai_director.py — AI-Driven Video Editing Engine (v2)
+ai_director.py — AI-Driven Video Editing Engine (v3)
 
-Uses Gemini 1.5 Flash to analyze each raw animal clip and generate a precise
-editing plan (punch text, timestamps, meme insert point). Then uses MoviePy
-to assemble the final reel on a White Meme Card template.
+v3 upgrades:
+  - faster-whisper: Extracts word-level timestamps from audio → renders
+    dynamic word-by-word captions on screen (Alex Hormozi caption style)
+  - Gemini 1.5 Flash: Analyzes each clip for punchline text + meme inserts
+  - MoviePy: Assembles everything on a White Meme Card template
 
-Architecture:
-  1. Upload raw video to Gemini Files API
-  2. Prompt Gemini to return a strict JSON editing plan
-  3. Use MoviePy to:
-     a. Create 1080x1920 white canvas background
-     b. Place the video centered in the canvas
-     c. Render punchline text (Impact font) at Gemini-specified timestamps
-     d. Split video at meme_insert_timestamp, insert meme clip, resume
-     e. Burn @madanimalx branding at the bottom
-  4. Concatenate all assembled clips into the final reel
+Caption rendering flow:
+  1. Extract audio from raw clip → /tmp WAV
+  2. Run faster-whisper (base model) → get segments with word-level timestamps
+  3. Create a MoviePy TextClip per word, timed precisely to when it's spoken
+  4. Overlay all word clips over the center video on the white card
 
-Graceful fallback: if Gemini returns invalid JSON or the API call fails,
-the clip is assembled without mid-clip meme splits (standard path).
+No TTS or AI voice generation — captions are pure visual text overlays.
 """
 
 import os
@@ -25,7 +21,7 @@ import sys
 import json
 import time
 import random
-import shutil
+import subprocess
 import argparse
 import tempfile
 from pathlib import Path
@@ -59,8 +55,8 @@ for d in [PROCESSED_DIR, OUTPUT_DIR]:
 # Canvas
 CARD_W, CARD_H = 1080, 1920
 BRAND_TEXT = "@madanimalx"
-MAX_CLIP_DURATION = 10.0     # hard cap per source clip (seconds)
-MEME_DURATION = 3.0          # max seconds to take from each meme insert
+MAX_CLIP_DURATION = 10.0
+MEME_DURATION = 3.0
 
 # Font paths (fallback chain)
 IMPACT_CANDIDATES = [
@@ -94,25 +90,146 @@ Rules:
 Return ONLY the JSON object."""
 
 
-# ── Helper: find best available font ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  FASTER-WHISPER: Word-by-word caption extraction
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _find_font(size: int = 60) -> str:
-    """Return path string to the best available Impact-style font."""
-    for p in IMPACT_CANDIDATES:
-        if Path(p).exists():
-            return str(p)
-    return ""   # MoviePy will use default if empty
-
-
-def _make_white_card() -> np.ndarray:
+def extract_audio_wav(video_path: Path) -> Optional[Path]:
     """
-    Return a numpy array (H×W×3) of a pure white 1080x1920 frame.
-    MoviePy ImageClip accepts numpy arrays directly.
+    Extract audio from a video file as a 16kHz mono WAV.
+    faster-whisper works best with 16kHz mono input.
+    Returns path to the temporary WAV file, or None on failure.
     """
-    return np.full((CARD_H, CARD_W, 3), 255, dtype=np.uint8)
+    wav_path = Path(tempfile.mktemp(suffix=".wav", dir="/tmp"))
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(video_path),
+        "-ac", "1",             # mono
+        "-ar", "16000",         # 16kHz
+        "-vn",                  # no video
+        str(wav_path)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 1000:
+            return wav_path
+        print(f"[ai_director] Audio extraction failed: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"[ai_director] Audio extraction error: {e}")
+    return None
 
 
-# ── Step 1: Gemini video analysis ─────────────────────────────────────────────
+def transcribe_with_whisper(audio_path: Path, model_size: str = "base") -> list[dict]:
+    """
+    Run faster-whisper on an audio file and return word-level timestamps.
+
+    Returns a list of dicts:
+        [{"word": "hello", "start": 0.5, "end": 0.8}, ...]
+
+    Uses the 'base' model by default for speed. Switch to 'small' for
+    better accuracy on noisy animal videos.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("[ai_director] faster-whisper not installed — skipping dynamic captions")
+        return []
+
+    try:
+        print(f"[ai_director] Loading faster-whisper '{model_size}' model ...")
+        model = WhisperModel(
+            model_size,
+            device="cpu",          # Use GPU if available: device="cuda"
+            compute_type="int8",   # Fast inference on CPU
+        )
+
+        print(f"[ai_director] Transcribing {audio_path.name} ...")
+        segments, info = model.transcribe(
+            str(audio_path),
+            beam_size=5,
+            word_timestamps=True,  # CRITICAL: enables per-word timing
+            language=None,         # auto-detect language
+        )
+
+        words = []
+        for segment in segments:
+            if segment.words:
+                for w in segment.words:
+                    words.append({
+                        "word": w.word.strip(),
+                        "start": round(w.start, 3),
+                        "end": round(w.end, 3),
+                    })
+
+        print(f"[ai_director] ✓ Transcribed {len(words)} words")
+        return words
+
+    except Exception as e:
+        print(f"[ai_director] Whisper transcription error: {e}")
+        return []
+
+
+def build_word_caption_clips(
+    words: list[dict],
+    video_y_top: int,
+    video_height: int,
+) -> list:
+    """
+    Create MoviePy TextClip objects for each transcribed word, rendered
+    word-by-word over the video area (Alex Hormozi caption style).
+
+    Each word appears at its exact spoken timestamp and disappears when done.
+    Positioned in the lower-third of the video area for readability.
+
+    Args:
+        words: list of {"word", "start", "end"} dicts from faster-whisper
+        video_y_top: y-coordinate where the video starts on the white card
+        video_height: height of the video area
+
+    Returns:
+        List of positioned, timed TextClip objects ready for CompositeVideoClip.
+    """
+    if not words:
+        return []
+
+    font_path = _find_font(80)
+    clips = []
+
+    # Caption y-position: lower third of the video area
+    caption_y = video_y_top + int(video_height * 0.75)
+
+    for w in words:
+        word_text = w["word"].upper()
+        duration = w["end"] - w["start"]
+        if duration < 0.05 or not word_text.strip():
+            continue
+
+        try:
+            clip = TextClip(
+                word_text,
+                fontsize=80,
+                color="yellow",
+                font=font_path if font_path else "Impact",
+                stroke_color="black",
+                stroke_width=4,       # thick black stroke for visibility
+                method="caption",
+                size=(CARD_W - 100, None),
+                align="center",
+            ).set_start(w["start"]).set_duration(duration).set_position(
+                ("center", caption_y)
+            )
+            clips.append(clip)
+        except Exception as e:
+            # Skip words that fail to render (emoji, special chars)
+            continue
+
+    print(f"[ai_director] ✓ Built {len(clips)} word caption overlays")
+    return clips
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GEMINI: Video analysis
+# ══════════════════════════════════════════════════════════════════════════════
 
 def analyse_with_gemini(
     video_path: Path,
@@ -120,26 +237,19 @@ def analyse_with_gemini(
     retries: int = 2,
 ) -> Optional[dict]:
     """
-    Upload video_path to Gemini Files API, send the director prompt,
-    and return the parsed JSON editing plan.
-
-    Wrapper around the new google-genai SDK (google.genai.Client).
-    Uploads video to Gemini Files API, sends the director prompt,
-    and returns the parsed JSON editing plan.
-    Returns None on failure (triggers fallback path).
+    Upload video to Gemini 1.5 Flash and return JSON editing plan.
+    Returns None on failure (triggers fallback).
     """
     client = genai.Client(api_key=gemini_key)
 
     for attempt in range(retries + 1):
         try:
             print(f"[ai_director] Uploading {video_path.name} to Gemini Files API ...")
-            # Upload file using Files API
             uploaded = client.files.upload(
                 path=str(video_path),
                 config={"mime_type": "video/mp4", "display_name": video_path.stem},
             )
 
-            # Wait for file to become ACTIVE
             for _ in range(20):
                 file_info = client.files.get(name=uploaded.name)
                 if file_info.state.name == "ACTIVE":
@@ -160,20 +270,17 @@ def analyse_with_gemini(
                 ),
             )
 
-            # Clean up uploaded file
             try:
                 client.files.delete(name=uploaded.name)
             except Exception:
                 pass
 
             raw_text = response.text.strip()
-            # Strip any accidental markdown fences
             raw_text = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
             plan = json.loads(raw_text)
-            # Validate required keys
             required = {"punchline_text", "text_start_time", "text_end_time",
-                       "meme_insert_timestamp", "meme_filename"}
+                        "meme_insert_timestamp", "meme_filename"}
             if not required.issubset(plan.keys()):
                 raise ValueError(f"Missing keys: {required - plan.keys()}")
 
@@ -188,18 +295,32 @@ def analyse_with_gemini(
         if attempt < retries:
             time.sleep(2)
 
-    return None   # All attempts failed → caller uses fallback
+    return None
 
 
-# ── Step 2: Build a single clip segment using MoviePy ─────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  MOVIEPY: Assembly helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_font(size: int = 60) -> str:
+    """Return path string to the best available Impact-style font."""
+    for p in IMPACT_CANDIDATES:
+        if Path(p).exists():
+            return str(p)
+    return ""
+
+
+def _make_white_card() -> np.ndarray:
+    """Return a numpy array (H×W×3) of a pure white 1080x1920 frame."""
+    return np.full((CARD_H, CARD_W, 3), 255, dtype=np.uint8)
+
 
 def _resolve_meme(meme_filename: str) -> Optional[Path]:
-    """Find a meme insert file by name, case-insensitive. Returns None if missing."""
+    """Find a meme insert file by name, case-insensitive."""
     target = meme_filename.strip().lower()
     for f in MEME_DIR.glob("*.mp4"):
         if f.name.lower() == target:
             return f
-    # If exact match not found, pick any random meme
     available = list(MEME_DIR.glob("*.mp4"))
     if available:
         chosen = random.choice(available)
@@ -208,22 +329,21 @@ def _resolve_meme(meme_filename: str) -> Optional[Path]:
     return None
 
 
-def _resize_video_for_canvas(clip: VideoFileClip) -> VideoFileClip:
+def _resize_video_for_canvas(clip: VideoFileClip) -> tuple:
     """
     Resize a VideoFileClip to fit within CARD_W (1080px) preserving aspect ratio.
-    The clip is NOT cropped — it fits within the canvas.
+    Returns (resized_clip, new_w, new_h).
     """
     src_w, src_h = clip.size
     scale = CARD_W / src_w
     new_w = CARD_W
     new_h = int(src_h * scale)
-    # Cap height to avoid overflowing the canvas
-    if new_h > CARD_H - 200:   # leave room for text/branding
+    if new_h > CARD_H - 200:
         scale = (CARD_H - 200) / src_h
         new_w = int(src_w * scale)
         new_h = CARD_H - 200
 
-    return clip.resize((new_w, new_h))
+    return clip.resize((new_w, new_h)), new_w, new_h
 
 
 def _build_branding_clip(duration: float) -> TextClip:
@@ -240,13 +360,12 @@ def _build_branding_clip(duration: float) -> TextClip:
             align="center",
         ).set_duration(duration)
     except Exception:
-        # Ultra-safe fallback if TextClip fails
         brand = ColorClip(size=(CARD_W, 60), color=[255, 255, 255]).set_duration(duration)
     return brand
 
 
 def _build_punchline_clip(text: str, start: float, end: float) -> TextClip:
-    """Return a TextClip for the Gemini-specified punchline at given time window."""
+    """Return a TextClip for the Gemini-specified punchline."""
     font_path = _find_font(68)
     duration = end - start
     try:
@@ -267,55 +386,80 @@ def _build_punchline_clip(text: str, start: float, end: float) -> TextClip:
     return clip
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ASSEMBLY: Build a single clip segment
+# ══════════════════════════════════════════════════════════════════════════════
+
 def assemble_single_clip(
     raw_clip_path: Path,
     plan: Optional[dict],
     clip_index: int,
 ) -> Optional[Path]:
     """
-    Assemble one processed Reel segment from a single raw clip + AI plan.
+    Assemble one processed Reel segment from a raw clip + AI plan + whisper captions.
 
-    If plan is None (fallback), assembles the clip without meme insert.
-
-    Returns path to the processed segment .mp4, or None on failure.
+    Pipeline:
+      1. Load & trim animal clip
+      2. faster-whisper → word-level timestamps
+      3. White card canvas + centered video
+      4. Word-by-word dynamic captions (yellow text, black stroke) over video
+      5. Gemini punchline text (if available)
+      6. @madanimalx branding
+      7. Meme insert split (if Gemini specified)
     """
     dest = PROCESSED_DIR / f"segment_{clip_index:02d}.mp4"
 
     try:
-        # ── Load and trim the source animal clip ──────────────────
+        # ── Load and trim ─────────────────────────────────────────
         animal = VideoFileClip(str(raw_clip_path)).subclip(0, min(
             MAX_CLIP_DURATION,
             VideoFileClip(str(raw_clip_path)).duration
         ))
+        total_duration = animal.duration
 
-        total_duration = animal.duration  # may be split later
+        # ── faster-whisper: extract word captions ─────────────────
+        word_clips = []
+        wav_path = extract_audio_wav(raw_clip_path)
+        if wav_path:
+            words = transcribe_with_whisper(wav_path, model_size="base")
+            # Clean up temp WAV
+            try:
+                wav_path.unlink()
+            except Exception:
+                pass
+        else:
+            words = []
 
         # ── White card background ─────────────────────────────────
         white_bg = ImageClip(_make_white_card()).set_duration(total_duration)
 
-        # ── Resize the animal video to fit the canvas ─────────────
-        animal_resized = _resize_video_for_canvas(animal)
-        av_w, av_h = animal_resized.size
-
-        # Center the video on the card
+        # ── Resize video and position on card ─────────────────────
+        animal_resized, av_w, av_h = _resize_video_for_canvas(animal)
         pos_x = (CARD_W - av_w) // 2
         pos_y = (CARD_H - av_h) // 2
-
         animal_positioned = animal_resized.set_position((pos_x, pos_y))
 
-        # ── Branding (full duration) ───────────────────────────────
+        # ── Build word-by-word caption clips ──────────────────────
+        # Position captions over the lower-third of the video area
+        if words:
+            word_clips = build_word_caption_clips(
+                words,
+                video_y_top=pos_y,
+                video_height=av_h,
+            )
+
+        # ── Branding at bottom ────────────────────────────────────
         brand_clip = _build_branding_clip(total_duration)
         brand_y = CARD_H - 100
         brand_clip = brand_clip.set_position(("center", brand_y))
 
-        # ── Layers: background + video + brand ────────────────────
-        layers = [white_bg, animal_positioned, brand_clip]
+        # ── Layers: background + video + word captions + brand ────
+        layers = [white_bg, animal_positioned] + word_clips + [brand_clip]
 
-        # ── Punchline text (from AI plan) ─────────────────────────
+        # ── Gemini punchline text (top of card) ───────────────────
         if plan:
             t_start = float(plan.get("text_start_time", 0.5))
             t_end = float(plan.get("text_end_time", 3.0))
-            # Clamp to clip duration
             t_start = max(0.0, min(t_start, total_duration - 0.5))
             t_end = max(t_start + 0.5, min(t_end, total_duration))
 
@@ -325,26 +469,22 @@ def assemble_single_clip(
             ).set_position(("center", 60))
             layers.append(punchline)
 
-        # ── Composite all layers into one clip ────────────────────
+        # ── Composite ─────────────────────────────────────────────
         composite = CompositeVideoClip(layers, size=(CARD_W, CARD_H))
 
-        # ── Meme insert (split the video) ─────────────────────────
+        # ── Meme insert (split the video at Gemini timestamp) ─────
         if plan and plan.get("meme_insert_timestamp"):
             split_t = float(plan["meme_insert_timestamp"])
             split_t = max(1.0, min(split_t, total_duration - 1.0))
-
             meme_path = _resolve_meme(plan.get("meme_filename", ""))
 
             if meme_path and split_t < composite.duration:
-                # Part 1: before the meme
                 part1 = composite.subclip(0, split_t)
 
-                # Meme clip on white card
                 meme_raw = VideoFileClip(str(meme_path)).subclip(0, min(
                     MEME_DURATION, VideoFileClip(str(meme_path)).duration
                 ))
-                meme_resized = _resize_video_for_canvas(meme_raw)
-                me_w, me_h = meme_resized.size
+                meme_resized, me_w, me_h = _resize_video_for_canvas(meme_raw)
                 meme_bg = ImageClip(_make_white_card()).set_duration(meme_raw.duration)
                 meme_pos = meme_resized.set_position(
                     ((CARD_W - me_w) // 2, (CARD_H - me_h) // 2)
@@ -356,12 +496,10 @@ def assemble_single_clip(
                     [meme_bg, meme_pos, meme_brand], size=(CARD_W, CARD_H)
                 ).set_duration(meme_raw.duration)
 
-                # Part 2: after the meme
                 part2 = composite.subclip(split_t)
-
                 composite = concatenate_videoclips([part1, meme_composite, part2])
 
-        # ── Write segment to disk ─────────────────────────────────
+        # ── Write segment ─────────────────────────────────────────
         composite.write_videofile(
             str(dest),
             fps=30,
@@ -369,7 +507,7 @@ def assemble_single_clip(
             audio_codec="aac",
             preset="fast",
             ffmpeg_params=["-crf", "23", "-movflags", "+faststart"],
-            logger=None,   # suppress verbose MoviePy output
+            logger=None,
         )
         composite.close()
         animal.close()
@@ -381,13 +519,17 @@ def assemble_single_clip(
         return None
 
 
-# ── Step 3: Assemble the full reel ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  FULL REEL: Process all clips and concatenate
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
     """
-    Main entrypoint. Processes each raw clip with Gemini analysis + MoviePy assembly.
-    Falls back gracefully to no-meme-insert mode if Gemini fails.
-    Returns path to final output .mp4.
+    Main entrypoint. For each raw clip:
+      1. Gemini analysis (punchline + meme timing)
+      2. faster-whisper transcription (word-level captions)
+      3. MoviePy assembly (white card + video + captions + brand)
+    Falls back gracefully on any individual failure.
     """
     segments: list[Path] = []
 
@@ -395,15 +537,15 @@ def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
         print(f"\n[ai_director] Processing clip {i+1}/{len(raw_clips)}: {clip.name}")
 
         # ── AI analysis ───────────────────────────────────────────
+        plan = None
         if gemini_key:
             plan = analyse_with_gemini(clip, gemini_key)
             if not plan:
-                print("[ai_director] Gemini failed — using standard fallback for this clip")
+                print("[ai_director] Gemini failed — using fallback for this clip")
         else:
             print("[ai_director] No GEMINI_API_KEY — using fallback")
-            plan = None
 
-        # ── Assemble segment ──────────────────────────────────────
+        # ── Assemble segment (includes whisper captions) ──────────
         seg = assemble_single_clip(clip, plan, i)
         if seg:
             segments.append(seg)
@@ -444,9 +586,10 @@ def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Director — Gemini + MoviePy Reel Assembly")
+    parser = argparse.ArgumentParser(description="AI Director v3 — Gemini + Whisper + MoviePy")
     parser.add_argument("--clips", nargs="+", required=True, help="Paths to raw .mp4 clips")
     parser.add_argument("--no-ai", action="store_true", help="Skip Gemini, use fallback mode")
+    parser.add_argument("--whisper-model", default="base", help="Whisper model: tiny/base/small")
     args = parser.parse_args()
 
     from dotenv import load_dotenv
