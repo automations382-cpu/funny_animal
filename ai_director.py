@@ -171,7 +171,7 @@ def generate_caption_groq(
     try:
         print(f"[ai_director] Generating caption via Groq (Llama 3) ...")
         response = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You write viral Instagram captions for animal content."},
                 {"role": "user", "content": prompt},
