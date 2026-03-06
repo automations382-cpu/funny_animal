@@ -23,7 +23,7 @@ TARGET_CLIP_COUNT = 8
 MAX_DURATION = 90
 
 SUBREDDITS = ["funnyanimals", "AnimalsBeingDerps", "aww", "catvideos", "dogvideos"]
-YT_QUERIES = ["funny cat shorts", "funny dog fail shorts", "cute animal funny moment"]
+YT_QUERIES = ["funny animal fails 2026", "dog memes shorts", "cute cat fails shorts"]
 PEXELS_Q = ["funny cat", "funny dog", "funny animal"]
 PIXABAY_Q = ["funny animal", "funny pet", "cute dog funny"]
 
@@ -36,7 +36,11 @@ def fetch_reddit_json(subreddit: str, user_agent: str, limit: int = 10) -> list[
     """Fetch top video posts from a subreddit via public .json endpoint."""
     url = f"https://www.reddit.com/r/{subreddit}/top.json"
     params = {"t": "day", "limit": limit, "raw_json": 1}
-    headers = {"User-Agent": user_agent}
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         if resp.status_code == 429:
@@ -207,8 +211,19 @@ def fetch_clips(
     # YouTube Shorts
     if len(collected) < count:
         before = set(RAW_DIR.glob("*.mp4"))
-        yt = fetch_yt_shorts(random.choice(YT_QUERIES), min(count - len(collected), 4))
-        collected += [p for p in yt if p not in before and p not in collected]
+        random.shuffle(YT_QUERIES)
+        for query in YT_QUERIES:
+            if len(collected) >= count:
+                break
+            yt = fetch_yt_shorts(query, min(count - len(collected), 4))
+            added = 0
+            for p in yt:
+                if p not in before and p not in collected:
+                    collected.append(p)
+                    added += 1
+            if added > 0:
+                print(f"[sourcer] Added {added} clips from YT query: '{query}'")
+                break  # If we got at least one batch from YT, we can stop or keep going, let's break to save time.
 
     # Pexels / Pixabay
     if len(collected) < count and (pexels_key or pixabay_key):
