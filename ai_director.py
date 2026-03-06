@@ -1,19 +1,17 @@
 """
-ai_director.py — AI-Driven Video Editing Engine (v3)
+ai_director.py — AI-Driven Video Editing Engine (v4)
 
-v3 upgrades:
-  - faster-whisper: Extracts word-level timestamps from audio → renders
-    dynamic word-by-word captions on screen (Alex Hormozi caption style)
-  - Gemini 1.5 Flash: Analyzes each clip for punchline text + meme inserts
-  - MoviePy: Assembles everything on a White Meme Card template
+v4 upgrades:
+  - Tenor API: Fetches meme clips on-the-fly (no local meme folder required)
+  - faster-whisper: Word-by-word dynamic captions (Hormozi style)
+  - Gemini 1.5 Flash: Video analysis for punchline + meme selection
+  - MoviePy: Assembly on White Meme Card template
 
-Caption rendering flow:
-  1. Extract audio from raw clip → /tmp WAV
-  2. Run faster-whisper (base model) → get segments with word-level timestamps
-  3. Create a MoviePy TextClip per word, timed precisely to when it's spoken
-  4. Overlay all word clips over the center video on the white card
-
-No TTS or AI voice generation — captions are pure visual text overlays.
+Flow per clip:
+  1. Gemini analysis → JSON plan (punchline, timestamps, meme keyword)
+  2. Tenor API → downloads the best .mp4 for the meme keyword
+  3. faster-whisper → word-level timestamps from audio
+  4. MoviePy → white card + video + word captions + meme insert + branding
 """
 
 import os
@@ -28,6 +26,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+import requests as http_requests   # alias to avoid clash with google imports
 import google.genai as genai
 from google.genai import types as genai_types
 from moviepy.editor import (
@@ -38,18 +37,16 @@ from moviepy.editor import (
     TextClip,
     ColorClip,
 )
-from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-MEME_DIR = BASE_DIR / "meme_inserts"
 FONTS_DIR = BASE_DIR / "assets" / "fonts"
 PROCESSED_DIR = BASE_DIR / ".tmp" / "processed"
+MEME_CACHE_DIR = BASE_DIR / ".tmp" / "meme_cache"
 OUTPUT_DIR = BASE_DIR / ".tmp" / "output"
 
-for d in [PROCESSED_DIR, OUTPUT_DIR]:
+for d in [PROCESSED_DIR, MEME_CACHE_DIR, OUTPUT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Canvas
@@ -69,7 +66,7 @@ IMPACT_CANDIDATES = [
 # ── Gemini prompt ──────────────────────────────────────────────────────────────
 DIRECTOR_PROMPT = """You are a viral Instagram Reels editor specializing in funny animal content.
 
-Analyze the uploaded animal video carefully. You must return ONLY a single valid JSON object — no markdown fences, no extra text.
+Analyze the uploaded animal video carefully. Return ONLY a single valid JSON object — no markdown fences, no extra text.
 
 Fields required:
 {
@@ -77,7 +74,7 @@ Fields required:
   "text_start_time": <float, seconds when text should appear>,
   "text_end_time": <float, seconds when text should disappear>,
   "meme_insert_timestamp": <float, exact second to pause video and insert meme>,
-  "meme_filename": "One of: doge_dance.mp4 | cat_laugh.mp4 | dog_surprised.mp4 | cat_piano.mp4 | dog_fail.mp4"
+  "meme_search_query": "A 2-3 word Tenor search query for the perfect reaction meme (e.g. 'laughing cat', 'shocked pikachu', 'doge dance', 'facepalm')"
 }
 
 Rules:
@@ -85,9 +82,101 @@ Rules:
 - meme_insert_timestamp must be > 1.0 and < (video_duration - 1.0)
 - text_end_time must be > text_start_time
 - punchline_text must be funny and match the action in the video
-- choose the meme_filename that best fits the moment
+- meme_search_query must describe a reaction that fits the moment
 
 Return ONLY the JSON object."""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TENOR API: On-the-fly meme fetching
+# ══════════════════════════════════════════════════════════════════════════════
+
+TENOR_API_BASE = "https://tenor.googleapis.com/v2/search"
+
+def fetch_tenor_meme(
+    search_query: str,
+    tenor_api_key: str = "",
+) -> Optional[Path]:
+    """
+    Search Tenor for a meme GIF/MP4 by query. Downloads the top result as .mp4.
+
+    Uses the free Tenor API v2 endpoint. If no API key is provided,
+    tries with a basic anonymous request (may be rate-limited).
+
+    Args:
+        search_query: e.g. "laughing cat", "doge dance", "shocked pikachu"
+        tenor_api_key: Google API key with Tenor API enabled (optional but recommended)
+
+    Returns:
+        Path to downloaded .mp4 meme clip, or None on failure.
+    """
+    # Sanitize query for caching
+    cache_name = search_query.lower().replace(" ", "_")[:30]
+    cached = MEME_CACHE_DIR / f"tenor_{cache_name}.mp4"
+    if cached.exists() and cached.stat().st_size > 10_000:
+        print(f"[ai_director] Tenor cache hit: {cached.name}")
+        return cached
+
+    # Build API request
+    params = {
+        "q": search_query,
+        "limit": 5,
+        "media_filter": "mp4",
+        "contentfilter": "medium",
+    }
+    if tenor_api_key:
+        params["key"] = tenor_api_key
+    else:
+        # Try anonymous — works but may be limited
+        params["key"] = "AIzaSyAyimkuYQYF_FXVALexPuGQctUWRURdCYQ"  # Tenor public demo key
+
+    try:
+        print(f"[ai_director] Searching Tenor for: '{search_query}' ...")
+        resp = http_requests.get(TENOR_API_BASE, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"[ai_director] Tenor API error: HTTP {resp.status_code}")
+            return None
+
+        results = resp.json().get("results", [])
+        if not results:
+            print(f"[ai_director] Tenor: no results for '{search_query}'")
+            return None
+
+        # Find the best mp4 URL from the top result
+        mp4_url = None
+        for result in results:
+            media_formats = result.get("media_formats", {})
+            # Prefer mp4 format, then loopedmp4, then tinymp4
+            for fmt in ["mp4", "loopedmp4", "tinymp4"]:
+                if fmt in media_formats:
+                    mp4_url = media_formats[fmt].get("url")
+                    if mp4_url:
+                        break
+            if mp4_url:
+                break
+
+        if not mp4_url:
+            print(f"[ai_director] Tenor: no mp4 format found for '{search_query}'")
+            return None
+
+        # Download the meme clip
+        print(f"[ai_director] Downloading Tenor meme → {cached.name} ...")
+        with http_requests.get(mp4_url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(cached, "wb") as f:
+                for chunk in r.iter_content(chunk_size=262144):
+                    f.write(chunk)
+
+        if cached.stat().st_size > 5_000:
+            print(f"[ai_director] ✓ Tenor meme downloaded: {cached.name}")
+            return cached
+        else:
+            cached.unlink()
+            return None
+
+    except Exception as e:
+        print(f"[ai_director] Tenor error: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,18 +184,12 @@ Return ONLY the JSON object."""
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_audio_wav(video_path: Path) -> Optional[Path]:
-    """
-    Extract audio from a video file as a 16kHz mono WAV.
-    faster-whisper works best with 16kHz mono input.
-    Returns path to the temporary WAV file, or None on failure.
-    """
+    """Extract audio from a video file as a 16kHz mono WAV."""
     wav_path = Path(tempfile.mktemp(suffix=".wav", dir="/tmp"))
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(video_path),
-        "-ac", "1",             # mono
-        "-ar", "16000",         # 16kHz
-        "-vn",                  # no video
+        "-ac", "1", "-ar", "16000", "-vn",
         str(wav_path)
     ]
     try:
@@ -122,12 +205,7 @@ def extract_audio_wav(video_path: Path) -> Optional[Path]:
 def transcribe_with_whisper(audio_path: Path, model_size: str = "base") -> list[dict]:
     """
     Run faster-whisper on an audio file and return word-level timestamps.
-
-    Returns a list of dicts:
-        [{"word": "hello", "start": 0.5, "end": 0.8}, ...]
-
-    Uses the 'base' model by default for speed. Switch to 'small' for
-    better accuracy on noisy animal videos.
+    Returns: [{"word": "hello", "start": 0.5, "end": 0.8}, ...]
     """
     try:
         from faster_whisper import WhisperModel
@@ -137,18 +215,11 @@ def transcribe_with_whisper(audio_path: Path, model_size: str = "base") -> list[
 
     try:
         print(f"[ai_director] Loading faster-whisper '{model_size}' model ...")
-        model = WhisperModel(
-            model_size,
-            device="cpu",          # Use GPU if available: device="cuda"
-            compute_type="int8",   # Fast inference on CPU
-        )
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
         print(f"[ai_director] Transcribing {audio_path.name} ...")
         segments, info = model.transcribe(
-            str(audio_path),
-            beam_size=5,
-            word_timestamps=True,  # CRITICAL: enables per-word timing
-            language=None,         # auto-detect language
+            str(audio_path), beam_size=5, word_timestamps=True, language=None,
         )
 
         words = []
@@ -163,9 +234,8 @@ def transcribe_with_whisper(audio_path: Path, model_size: str = "base") -> list[
 
         print(f"[ai_director] ✓ Transcribed {len(words)} words")
         return words
-
     except Exception as e:
-        print(f"[ai_director] Whisper transcription error: {e}")
+        print(f"[ai_director] Whisper error: {e}")
         return []
 
 
@@ -175,27 +245,15 @@ def build_word_caption_clips(
     video_height: int,
 ) -> list:
     """
-    Create MoviePy TextClip objects for each transcribed word, rendered
-    word-by-word over the video area (Alex Hormozi caption style).
-
-    Each word appears at its exact spoken timestamp and disappears when done.
-    Positioned in the lower-third of the video area for readability.
-
-    Args:
-        words: list of {"word", "start", "end"} dicts from faster-whisper
-        video_y_top: y-coordinate where the video starts on the white card
-        video_height: height of the video area
-
-    Returns:
-        List of positioned, timed TextClip objects ready for CompositeVideoClip.
+    Create MoviePy TextClip for each transcribed word.
+    Hormozi style: yellow text, thick black stroke, centered, timed per-word.
+    Positioned in the lower-third of the video area.
     """
     if not words:
         return []
 
     font_path = _find_font(80)
     clips = []
-
-    # Caption y-position: lower third of the video area
     caption_y = video_y_top + int(video_height * 0.75)
 
     for w in words:
@@ -203,7 +261,6 @@ def build_word_caption_clips(
         duration = w["end"] - w["start"]
         if duration < 0.05 or not word_text.strip():
             continue
-
         try:
             clip = TextClip(
                 word_text,
@@ -211,7 +268,7 @@ def build_word_caption_clips(
                 color="yellow",
                 font=font_path if font_path else "Impact",
                 stroke_color="black",
-                stroke_width=4,       # thick black stroke for visibility
+                stroke_width=4,
                 method="caption",
                 size=(CARD_W - 100, None),
                 align="center",
@@ -219,8 +276,7 @@ def build_word_caption_clips(
                 ("center", caption_y)
             )
             clips.append(clip)
-        except Exception as e:
-            # Skip words that fail to render (emoji, special chars)
+        except Exception:
             continue
 
     print(f"[ai_director] ✓ Built {len(clips)} word caption overlays")
@@ -236,15 +292,12 @@ def analyse_with_gemini(
     gemini_key: str,
     retries: int = 2,
 ) -> Optional[dict]:
-    """
-    Upload video to Gemini 1.5 Flash and return JSON editing plan.
-    Returns None on failure (triggers fallback).
-    """
+    """Upload video to Gemini 1.5 Flash, return JSON editing plan."""
     client = genai.Client(api_key=gemini_key)
 
     for attempt in range(retries + 1):
         try:
-            print(f"[ai_director] Uploading {video_path.name} to Gemini Files API ...")
+            print(f"[ai_director] Uploading {video_path.name} to Gemini ...")
             uploaded = client.files.upload(
                 path=str(video_path),
                 config={"mime_type": "video/mp4", "display_name": video_path.stem},
@@ -254,19 +307,16 @@ def analyse_with_gemini(
                 file_info = client.files.get(name=uploaded.name)
                 if file_info.state.name == "ACTIVE":
                     break
-                print("[ai_director] Waiting for Gemini file processing ...")
+                print("[ai_director] Waiting for file processing ...")
                 time.sleep(3)
             else:
-                print("[ai_director] File never became ACTIVE — skipping")
                 return None
 
-            print("[ai_director] Sending analysis prompt ...")
             response = client.models.generate_content(
                 model="gemini-1.5-flash",
                 contents=[uploaded, DIRECTOR_PROMPT],
                 config=genai_types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=500,
+                    temperature=0.7, max_output_tokens=500,
                 ),
             )
 
@@ -275,23 +325,22 @@ def analyse_with_gemini(
             except Exception:
                 pass
 
-            raw_text = response.text.strip()
-            raw_text = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            raw = response.text.strip()
+            raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
-            plan = json.loads(raw_text)
+            plan = json.loads(raw)
             required = {"punchline_text", "text_start_time", "text_end_time",
-                        "meme_insert_timestamp", "meme_filename"}
+                        "meme_insert_timestamp", "meme_search_query"}
             if not required.issubset(plan.keys()):
                 raise ValueError(f"Missing keys: {required - plan.keys()}")
 
-            print(f"[ai_director] ✓ Gemini plan: {plan}")
+            print(f"[ai_director] ✓ Gemini plan: {json.dumps(plan, indent=2)}")
             return plan
 
         except json.JSONDecodeError as e:
             print(f"[ai_director] JSON parse error (attempt {attempt+1}): {e}")
         except Exception as e:
             print(f"[ai_director] Gemini error (attempt {attempt+1}): {e}")
-
         if attempt < retries:
             time.sleep(2)
 
@@ -303,7 +352,6 @@ def analyse_with_gemini(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _find_font(size: int = 60) -> str:
-    """Return path string to the best available Impact-style font."""
     for p in IMPACT_CANDIDATES:
         if Path(p).exists():
             return str(p)
@@ -311,29 +359,11 @@ def _find_font(size: int = 60) -> str:
 
 
 def _make_white_card() -> np.ndarray:
-    """Return a numpy array (H×W×3) of a pure white 1080x1920 frame."""
     return np.full((CARD_H, CARD_W, 3), 255, dtype=np.uint8)
 
 
-def _resolve_meme(meme_filename: str) -> Optional[Path]:
-    """Find a meme insert file by name, case-insensitive."""
-    target = meme_filename.strip().lower()
-    for f in MEME_DIR.glob("*.mp4"):
-        if f.name.lower() == target:
-            return f
-    available = list(MEME_DIR.glob("*.mp4"))
-    if available:
-        chosen = random.choice(available)
-        print(f"[ai_director] Meme '{meme_filename}' not found — using {chosen.name}")
-        return chosen
-    return None
-
-
 def _resize_video_for_canvas(clip: VideoFileClip) -> tuple:
-    """
-    Resize a VideoFileClip to fit within CARD_W (1080px) preserving aspect ratio.
-    Returns (resized_clip, new_w, new_h).
-    """
+    """Resize to fit 1080px wide, preserving AR. Returns (clip, w, h)."""
     src_w, src_h = clip.size
     scale = CARD_W / src_w
     new_w = CARD_W
@@ -342,48 +372,34 @@ def _resize_video_for_canvas(clip: VideoFileClip) -> tuple:
         scale = (CARD_H - 200) / src_h
         new_w = int(src_w * scale)
         new_h = CARD_H - 200
-
     return clip.resize((new_w, new_h)), new_w, new_h
 
 
 def _build_branding_clip(duration: float) -> TextClip:
-    """Return a TextClip for the @madanimalx watermark at the bottom."""
     font_path = _find_font(50)
     try:
-        brand = TextClip(
-            BRAND_TEXT,
-            fontsize=52,
-            color="black",
+        return TextClip(
+            BRAND_TEXT, fontsize=52, color="black",
             font=font_path if font_path else "Impact",
-            method="caption",
-            size=(CARD_W, None),
-            align="center",
+            method="caption", size=(CARD_W, None), align="center",
         ).set_duration(duration)
     except Exception:
-        brand = ColorClip(size=(CARD_W, 60), color=[255, 255, 255]).set_duration(duration)
-    return brand
+        return ColorClip(size=(CARD_W, 60), color=[255, 255, 255]).set_duration(duration)
 
 
 def _build_punchline_clip(text: str, start: float, end: float) -> TextClip:
-    """Return a TextClip for the Gemini-specified punchline."""
     font_path = _find_font(68)
     duration = end - start
     try:
-        clip = TextClip(
-            text,
-            fontsize=68,
-            color="black",
+        return TextClip(
+            text, fontsize=68, color="black",
             font=font_path if font_path else "Impact",
-            stroke_color="white",
-            stroke_width=2,
-            method="caption",
-            size=(CARD_W - 80, None),
-            align="center",
+            stroke_color="white", stroke_width=2,
+            method="caption", size=(CARD_W - 80, None), align="center",
         ).set_start(start).set_duration(duration)
     except Exception as e:
-        print(f"[ai_director] TextClip error: {e} — skipping punchline")
-        clip = ColorClip(size=(0, 0), color=[255, 255, 255]).set_duration(0)
-    return clip
+        print(f"[ai_director] TextClip error: {e}")
+        return ColorClip(size=(0, 0), color=[255, 255, 255]).set_duration(0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -394,18 +410,15 @@ def assemble_single_clip(
     raw_clip_path: Path,
     plan: Optional[dict],
     clip_index: int,
+    tenor_api_key: str = "",
 ) -> Optional[Path]:
     """
-    Assemble one processed Reel segment from a raw clip + AI plan + whisper captions.
-
-    Pipeline:
-      1. Load & trim animal clip
-      2. faster-whisper → word-level timestamps
-      3. White card canvas + centered video
-      4. Word-by-word dynamic captions (yellow text, black stroke) over video
-      5. Gemini punchline text (if available)
-      6. @madanimalx branding
-      7. Meme insert split (if Gemini specified)
+    Assemble one Reel segment:
+      1. White card canvas + centered video (natural AR)
+      2. faster-whisper word-by-word captions (yellow/black, Hormozi style)
+      3. Gemini punchline text at top
+      4. Tenor meme insert at Gemini-specified timestamp
+      5. @madanimalx branding at bottom
     """
     dest = PROCESSED_DIR / f"segment_{clip_index:02d}.mp4"
 
@@ -418,65 +431,55 @@ def assemble_single_clip(
         total_duration = animal.duration
 
         # ── faster-whisper: extract word captions ─────────────────
-        word_clips = []
         wav_path = extract_audio_wav(raw_clip_path)
+        words = transcribe_with_whisper(wav_path) if wav_path else []
         if wav_path:
-            words = transcribe_with_whisper(wav_path, model_size="base")
-            # Clean up temp WAV
             try:
                 wav_path.unlink()
             except Exception:
                 pass
-        else:
-            words = []
 
         # ── White card background ─────────────────────────────────
         white_bg = ImageClip(_make_white_card()).set_duration(total_duration)
 
-        # ── Resize video and position on card ─────────────────────
+        # ── Resize video + center on card ─────────────────────────
         animal_resized, av_w, av_h = _resize_video_for_canvas(animal)
         pos_x = (CARD_W - av_w) // 2
         pos_y = (CARD_H - av_h) // 2
         animal_positioned = animal_resized.set_position((pos_x, pos_y))
 
-        # ── Build word-by-word caption clips ──────────────────────
-        # Position captions over the lower-third of the video area
-        if words:
-            word_clips = build_word_caption_clips(
-                words,
-                video_y_top=pos_y,
-                video_height=av_h,
-            )
+        # ── Word-by-word dynamic captions ─────────────────────────
+        word_clips = build_word_caption_clips(words, pos_y, av_h) if words else []
 
-        # ── Branding at bottom ────────────────────────────────────
+        # ── Branding ──────────────────────────────────────────────
         brand_clip = _build_branding_clip(total_duration)
         brand_y = CARD_H - 100
         brand_clip = brand_clip.set_position(("center", brand_y))
 
-        # ── Layers: background + video + word captions + brand ────
+        # ── Compose layers ────────────────────────────────────────
         layers = [white_bg, animal_positioned] + word_clips + [brand_clip]
 
-        # ── Gemini punchline text (top of card) ───────────────────
+        # ── Gemini punchline ──────────────────────────────────────
         if plan:
-            t_start = float(plan.get("text_start_time", 0.5))
-            t_end = float(plan.get("text_end_time", 3.0))
-            t_start = max(0.0, min(t_start, total_duration - 0.5))
-            t_end = max(t_start + 0.5, min(t_end, total_duration))
-
+            t_start = max(0.0, min(float(plan.get("text_start_time", 0.5)), total_duration - 0.5))
+            t_end = max(t_start + 0.5, min(float(plan.get("text_end_time", 3.0)), total_duration))
             punchline = _build_punchline_clip(
-                plan.get("punchline_text", ""),
-                t_start, t_end
+                plan.get("punchline_text", ""), t_start, t_end
             ).set_position(("center", 60))
             layers.append(punchline)
 
-        # ── Composite ─────────────────────────────────────────────
         composite = CompositeVideoClip(layers, size=(CARD_W, CARD_H))
 
-        # ── Meme insert (split the video at Gemini timestamp) ─────
-        if plan and plan.get("meme_insert_timestamp"):
+        # ── Tenor meme insert (on-the-fly download) ───────────────
+        if plan and plan.get("meme_insert_timestamp") and plan.get("meme_search_query"):
             split_t = float(plan["meme_insert_timestamp"])
             split_t = max(1.0, min(split_t, total_duration - 1.0))
-            meme_path = _resolve_meme(plan.get("meme_filename", ""))
+
+            # Fetch meme from Tenor API
+            meme_path = fetch_tenor_meme(
+                plan["meme_search_query"],
+                tenor_api_key=tenor_api_key,
+            )
 
             if meme_path and split_t < composite.duration:
                 part1 = composite.subclip(0, split_t)
@@ -501,12 +504,8 @@ def assemble_single_clip(
 
         # ── Write segment ─────────────────────────────────────────
         composite.write_videofile(
-            str(dest),
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            preset="fast",
-            ffmpeg_params=["-crf", "23", "-movflags", "+faststart"],
+            str(dest), fps=30, codec="libx264", audio_codec="aac",
+            preset="fast", ffmpeg_params=["-crf", "23", "-movflags", "+faststart"],
             logger=None,
         )
         composite.close()
@@ -523,30 +522,22 @@ def assemble_single_clip(
 #  FULL REEL: Process all clips and concatenate
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
-    """
-    Main entrypoint. For each raw clip:
-      1. Gemini analysis (punchline + meme timing)
-      2. faster-whisper transcription (word-level captions)
-      3. MoviePy assembly (white card + video + captions + brand)
-    Falls back gracefully on any individual failure.
-    """
+def build_ai_reel(raw_clips: list[Path], gemini_key: str, tenor_key: str = "") -> Optional[Path]:
+    """Main entrypoint. Process each clip with Gemini + Whisper + Tenor + MoviePy."""
     segments: list[Path] = []
 
     for i, clip in enumerate(raw_clips):
         print(f"\n[ai_director] Processing clip {i+1}/{len(raw_clips)}: {clip.name}")
 
-        # ── AI analysis ───────────────────────────────────────────
         plan = None
         if gemini_key:
             plan = analyse_with_gemini(clip, gemini_key)
             if not plan:
-                print("[ai_director] Gemini failed — using fallback for this clip")
+                print("[ai_director] Gemini failed — using fallback")
         else:
-            print("[ai_director] No GEMINI_API_KEY — using fallback")
+            print("[ai_director] No GEMINI_API_KEY — fallback mode")
 
-        # ── Assemble segment (includes whisper captions) ──────────
-        seg = assemble_single_clip(clip, plan, i)
+        seg = assemble_single_clip(clip, plan, i, tenor_api_key=tenor_key)
         if seg:
             segments.append(seg)
 
@@ -554,7 +545,6 @@ def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
         print("[ai_director] ERROR: No segments produced")
         return None
 
-    # ── Concatenate all segments ──────────────────────────────────
     print(f"\n[ai_director] Concatenating {len(segments)} segments ...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = OUTPUT_DIR / f"reel_ai_{timestamp}.mp4"
@@ -563,12 +553,8 @@ def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
         all_clips = [VideoFileClip(str(s)) for s in segments]
         final = concatenate_videoclips(all_clips, method="compose")
         final.write_videofile(
-            str(output_path),
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            preset="fast",
-            ffmpeg_params=["-crf", "23", "-movflags", "+faststart"],
+            str(output_path), fps=30, codec="libx264", audio_codec="aac",
+            preset="fast", ffmpeg_params=["-crf", "23", "-movflags", "+faststart"],
             logger=None,
         )
         final.close()
@@ -578,7 +564,6 @@ def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
         size_mb = output_path.stat().st_size / 1_048_576
         print(f"\n[ai_director] ✅ Final reel: {output_path.name} ({size_mb:.1f} MB)")
         return output_path
-
     except Exception as e:
         print(f"[ai_director] ERROR during final concat: {e}")
         return None
@@ -586,24 +571,21 @@ def build_ai_reel(raw_clips: list[Path], gemini_key: str) -> Optional[Path]:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Director v3 — Gemini + Whisper + MoviePy")
-    parser.add_argument("--clips", nargs="+", required=True, help="Paths to raw .mp4 clips")
-    parser.add_argument("--no-ai", action="store_true", help="Skip Gemini, use fallback mode")
-    parser.add_argument("--whisper-model", default="base", help="Whisper model: tiny/base/small")
+    parser = argparse.ArgumentParser(description="AI Director v4 — Gemini + Whisper + Tenor")
+    parser.add_argument("--clips", nargs="+", required=True)
+    parser.add_argument("--no-ai", action="store_true")
     args = parser.parse_args()
 
     from dotenv import load_dotenv
     load_dotenv(BASE_DIR.parent / ".env")
 
     gemini_key = "" if args.no_ai else os.getenv("GEMINI_API_KEY", "")
+    tenor_key = os.getenv("TENOR_API_KEY", "")
     clips = [Path(p) for p in args.clips if Path(p).exists()]
 
     if not clips:
-        print("[ai_director] No valid clip paths provided")
+        print("[ai_director] No valid clip paths")
         sys.exit(1)
 
-    result = build_ai_reel(clips, gemini_key)
-    if result:
-        print(f"[ai_director] Output: {result}")
-    else:
-        sys.exit(1)
+    result = build_ai_reel(clips, gemini_key, tenor_key)
+    sys.exit(0 if result else 1)

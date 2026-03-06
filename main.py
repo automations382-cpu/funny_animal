@@ -30,11 +30,11 @@ from captioner import generate_caption, fallback_caption, save_caption
 from uploader import upload_reel_package
 
 
-def run_ai_mode(raw_clips: list[Path], gemini_key: str) -> Path | None:
+def run_ai_mode(raw_clips: list[Path], gemini_key: str, tenor_key: str) -> Path | None:
     """Run the Gemini AI Director + MoviePy assembly pipeline."""
     from card_generator import generate_card
     from ai_director import build_ai_reel
-    return build_ai_reel(raw_clips, gemini_key)
+    return build_ai_reel(raw_clips, gemini_key, tenor_key)
 
 
 def run_ffmpeg_mode(
@@ -58,6 +58,7 @@ def main(mode: str = "ai", dry_run: bool = False):
     pexels_key = os.getenv("PEXELS_API_KEY", "")
     pixabay_key = os.getenv("PIXABAY_API_KEY", "")
     gemini_key = os.getenv("GEMINI_API_KEY", "")
+    tenor_key = os.getenv("TENOR_API_KEY", "")
 
     # ── STEP 1: Source ───────────────────────────────────────────
     print("\n[STEP 1] Sourcing videos...")
@@ -75,7 +76,7 @@ def main(mode: str = "ai", dry_run: bool = False):
     # ── STEP 3: Process video ────────────────────────────────────
     print(f"\n[STEP 3] Assembling reel ({mode} mode)...")
     if mode == "ai":
-        output_video = run_ai_mode(raw_clips, gemini_key)
+        output_video = run_ai_mode(raw_clips, gemini_key, tenor_key)
     else:
         output_video = run_ffmpeg_mode(raw_clips, caption_text)
 
