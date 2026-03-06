@@ -50,6 +50,9 @@ def main(mode: str = "ai", dry_run: bool = False):
     print(f"  Mode: {mode.upper()}")
     print("=" * 60)
 
+    pexels_key = os.getenv("PEXELS_API_KEY", "")
+    pixabay_key = os.getenv("PIXABAY_API_KEY", "")
+
     # ── STEP 1: Source ───────────────────────────────────────────
     print("\n[STEP 1] Sourcing videos...")
     raw_clips = fetch_clips(
