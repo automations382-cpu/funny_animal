@@ -1,0 +1,21 @@
+# Core HTTP / API
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Google APIs
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.1
+google-auth-oauthlib>=1.1.0
+google-generativeai>=0.7.0
+
+# Image processing (White Meme Card, watermark, emoji rendering)
+Pillow>=10.2.0
+
+# Video editing (MoviePy-based AI director assembly)
+moviepy>=1.0.3
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+numpy>=1.26.0
+
+# Video sourcing (Reddit, YouTube Shorts scraping — no API key needed)
+yt-dlp>=2024.3.10
