@@ -48,7 +48,7 @@ jobs:
       - name: Create credentials securely
         run: |
           echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
-          echo '${{ secrets.GOOGLE_TOKEN }}' > token.json
+          echo '${{ secrets.GOOGLE_TOKEN_JSON }}' > token.json
 
       - name: Run Pipeline
         env:
